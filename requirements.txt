@@ -6,3 +6,4 @@ selenium
 sqlalchemy
 psycopg2-binary
 webdriver-manager
+lxml
