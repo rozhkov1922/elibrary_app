@@ -1,5 +1,6 @@
 streamlit
 pandas
-selenium
+requests
+beautifulsoup4
 sqlalchemy
 psycopg2-binary
