@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import requests
+import time
 
 from bs4 import BeautifulSoup
 from sqlalchemy import create_engine
@@ -18,61 +19,92 @@ st.warning("⚠️ Приложение работает только внутр
 
 st.markdown(
     "Приложение получает список журналов автора из eLibrary по Author ID, "
-    "сопоставляет журналы с базой НИУ ВШЭ и формирует таблицу публикаций "
-    "и сводную таблицу по категориям журналов."
+    "сопоставляет журналы с базой НИУ ВШЭ и формирует две таблицы: "
+    "список публикаций и сводную таблицу по категориям журналов."
 )
 
 author_id = st.number_input("Введите Author ID (РИНЦ)", min_value=1, step=1)
-
 run_button = st.button("Запустить")
 
 # =========================
-# FUNCTIONS
+# CONFIG
+# =========================
+
+BASE_URL = "https://elibrary.ru"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Referer": BASE_URL
+}
+
+# =========================
+# PARSER (ROBUST)
 # =========================
 
 @st.cache_data(show_spinner=False)
 def parse_journals(author_id):
-    url = f"https://elibrary.ru/author_items_titles.asp?id={author_id}&show_refs=1&hide_doubles=1"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    url = f"{BASE_URL}/author_items_titles.asp?id={author_id}&show_refs=1&hide_doubles=1"
 
-    response = requests.get(url, headers=headers, timeout=20)
+    session = requests.Session()
 
-    if response.status_code != 200:
-        raise Exception("Ошибка загрузки страницы eLibrary")
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    rows = soup.select("tr[id^='title_']")
-
-    data = []
-
-    for row in rows:
+    # retry логика
+    for attempt in range(3):
         try:
-            rinc_id = int(row.get("id").split("_")[1])
-            text = row.get_text(strip=True)
+            # 1. прогрев
+            session.get(BASE_URL, headers=HEADERS, timeout=20)
+            time.sleep(1)
 
-            match = re.match(r"(.+?)\s*\((\d+)\)", text)
+            # 2. основной запрос
+            response = session.get(url, headers=HEADERS, timeout=20)
 
-            if match:
-                data.append({
-                    "author_id": author_id,
-                    "rinc_id": rinc_id,
-                    "journal": match.group(1),
-                    "publications": int(match.group(2))
-                })
-        except:
-            continue
+            if response.status_code != 200:
+                raise Exception("HTTP ошибка")
 
-    df = pd.DataFrame(data)
+            soup = BeautifulSoup(response.text, "html.parser")
+            rows = soup.select("tr[id^='title_']")
 
-    if df.empty:
-        raise Exception("Не удалось получить данные. Возможно, автор не найден.")
+            data = []
 
-    return df
+            for row in rows:
+                try:
+                    rinc_id = int(row.get("id").split("_")[1])
+                    text = row.get_text(strip=True)
 
+                    match = re.match(r"(.+?)\s*\((\d+)\)", text)
+
+                    if match:
+                        data.append({
+                            "author_id": author_id,
+                            "rinc_id": rinc_id,
+                            "journal": match.group(1),
+                            "publications": int(match.group(2))
+                        })
+                except:
+                    continue
+
+            df = pd.DataFrame(data)
+
+            if df.empty:
+                raise Exception("Пустой ответ (возможна блокировка)")
+
+            return df
+
+        except Exception as e:
+            time.sleep(2)
+
+    raise Exception(
+        "Не удалось получить данные.\n\n"
+        "Причины:\n"
+        "- Блокировка eLibrary\n"
+        "- Вы вне сети HSE / РФ\n"
+        "- Автор не существует"
+    )
+
+# =========================
+# DB
+# =========================
 
 @st.cache_data(show_spinner=False)
 def load_journal_mapping():
@@ -87,8 +119,12 @@ def load_journal_mapping():
 
     return pd.read_sql(query, engine)
 
+# =========================
+# PROCESSING
+# =========================
 
 def process_data(author_id):
+
     df_parsed = parse_journals(author_id)
     df_db = load_journal_mapping()
 
@@ -118,7 +154,6 @@ def process_data(author_id):
 
     return final_df, pivot_df
 
-
 # =========================
 # RUN
 # =========================
@@ -126,36 +161,30 @@ def process_data(author_id):
 if run_button and author_id:
 
     try:
-        with st.spinner("Обработка данных..."):
+        with st.spinner("Загрузка и обработка данных..."):
             final_df, pivot_df = process_data(author_id)
 
-        # =========================
-        # OUTPUT 1
-        # =========================
-
+        # ===== TABLE 1 =====
         st.subheader("Список публикаций автора (final_df)")
         st.dataframe(final_df, use_container_width=True)
 
         st.download_button(
-            label="Скачать final_df.csv",
-            data=final_df.to_csv(index=False).encode("utf-8"),
-            file_name="final_df.csv",
-            mime="text/csv"
+            "Скачать final_df.csv",
+            final_df.to_csv(index=False).encode("utf-8"),
+            "final_df.csv",
+            "text/csv"
         )
 
-        # =========================
-        # OUTPUT 2
-        # =========================
-
+        # ===== TABLE 2 =====
         st.subheader("Сводная таблица по спискам НИУ ВШЭ (pivot_df)")
         st.dataframe(pivot_df, use_container_width=True)
 
         st.download_button(
-            label="Скачать pivot_df.csv",
-            data=pivot_df.to_csv(index=False).encode("utf-8"),
-            file_name="pivot_df.csv",
-            mime="text/csv"
+            "Скачать pivot_df.csv",
+            pivot_df.to_csv(index=False).encode("utf-8"),
+            "pivot_df.csv",
+            "text/csv"
         )
 
     except Exception as e:
-        st.error(f"Ошибка: {str(e)}")
+        st.error(str(e))
