@@ -1,9 +1,6 @@
 streamlit
 pandas
 requests
-beautifulsoup4
-selenium
+lxml
 sqlalchemy
 psycopg2-binary
-webdriver-manager
-lxml
