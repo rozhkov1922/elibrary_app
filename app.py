@@ -7,9 +7,9 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-
 
 from sqlalchemy import create_engine
 
@@ -28,22 +28,37 @@ st.markdown(
 )
 
 author_id = st.number_input("Введите Author ID (РИНЦ)", min_value=1, step=1)
-
 run_button = st.button("Запустить")
 
 # =========================
-# FUNCTIONS
+# DRIVER (FIXED)
 # =========================
 
 def get_driver():
     options = webdriver.ChromeOptions()
+
+    # путь к chrome (важно для cloud)
+    options.binary_location = "/usr/bin/google-chrome"
+
+    # стабильные флаги
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--incognito")
 
-    return webdriver.Chrome(options=options)
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    )
+
+    service = Service(ChromeDriverManager().install())
+
+    return webdriver.Chrome(service=service, options=options)
+
+# =========================
+# PARSE
+# =========================
 
 def open_author(driver, author_id):
     URL_TEMPLATE = "https://elibrary.ru/author_items_titles.asp?id={}&order=0&selids=&show_hash=0&show_refs=1&hide_doubles=1&rand={}"
@@ -86,6 +101,9 @@ def parse_journals(driver, author_id):
 
     return pd.DataFrame(data)
 
+# =========================
+# DB
+# =========================
 
 def load_journal_mapping():
     engine = create_engine(
@@ -99,16 +117,19 @@ def load_journal_mapping():
 
     return pd.read_sql(query, engine)
 
-
 # =========================
-# MAIN LOGIC
+# MAIN
 # =========================
 
 if run_button and author_id:
 
     with st.spinner("Сбор данных..."):
 
-        driver = get_driver()
+        try:
+            driver = get_driver()
+        except Exception as e:
+            st.error("❌ Не удалось запустить Selenium. Запусти приложение локально или в сети HSE.")
+            st.stop()
 
         try:
             # парсинг
