@@ -1,27 +1,25 @@
 import streamlit as st
 import pandas as pd
 import re
-import random
+import requests
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
+from bs4 import BeautifulSoup
 from sqlalchemy import create_engine
 
 # =========================
-# STREAMLIT UI
+# UI
 # =========================
+
+st.set_page_config(page_title="RINC Parser", layout="wide")
 
 st.title("Парсинг публикаций автора eLibrary")
 
 st.warning("⚠️ Приложение работает только внутри корпоративной сети HSE.Work")
 
 st.markdown(
-    "Приложение парсит список журналов автора из eLibrary по его Author ID, "
-    "сопоставляет их с базой данных НИУ ВШЭ и строит сводную таблицу публикаций "
-    "по категориям журналов."
+    "Приложение получает список журналов автора из eLibrary по Author ID, "
+    "сопоставляет журналы с базой НИУ ВШЭ и формирует таблицу публикаций "
+    "и сводную таблицу по категориям журналов."
 )
 
 author_id = st.number_input("Введите Author ID (РИНЦ)", min_value=1, step=1)
@@ -32,56 +30,51 @@ run_button = st.button("Запустить")
 # FUNCTIONS
 # =========================
 
-def get_driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--incognito")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--headless=new")
-    return webdriver.Chrome(options=options)
+@st.cache_data(show_spinner=False)
+def parse_journals(author_id):
+    url = f"https://elibrary.ru/author_items_titles.asp?id={author_id}&show_refs=1&hide_doubles=1"
 
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-def open_author(driver, author_id):
-    URL_TEMPLATE = "https://elibrary.ru/author_items_titles.asp?id={}&order=0&selids=&show_hash=0&show_refs=1&hide_doubles=1&rand={}"
-    rand_value = f"{random.uniform(0, 0.3):.17f}"
-    url = URL_TEMPLATE.format(author_id, rand_value)
+    response = requests.get(url, headers=headers, timeout=20)
 
-    driver.get(url)
+    if response.status_code != 200:
+        raise Exception("Ошибка загрузки страницы eLibrary")
 
-    wait = WebDriverWait(driver, 15)
-    wait.until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "tr[id^='title_']"))
-    )
+    soup = BeautifulSoup(response.text, "html.parser")
 
+    rows = soup.select("tr[id^='title_']")
 
-def parse_journals(driver, author_id):
-    rows = driver.find_elements(By.CSS_SELECTOR, "tr[id^='title_']")
     data = []
 
     for row in rows:
         try:
-            row_id = row.get_attribute("id")
-            rinc_id = int(row_id.split("_")[1])
+            rinc_id = int(row.get("id").split("_")[1])
+            text = row.get_text(strip=True)
 
-            text = row.text.strip()
             match = re.match(r"(.+?)\s*\((\d+)\)", text)
 
             if match:
-                journal = match.group(1).strip()
-                publications = int(match.group(2))
-
                 data.append({
                     "author_id": author_id,
                     "rinc_id": rinc_id,
-                    "journal": journal,
-                    "publications": publications
+                    "journal": match.group(1),
+                    "publications": int(match.group(2))
                 })
-
-        except Exception:
+        except:
             continue
 
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+
+    if df.empty:
+        raise Exception("Не удалось получить данные. Возможно, автор не найден.")
+
+    return df
 
 
+@st.cache_data(show_spinner=False)
 def load_journal_mapping():
     engine = create_engine(
         "postgresql+psycopg2://supnc_team:_F6dq}Wg)M@192.168.206.41:5432/supnc"
@@ -95,71 +88,74 @@ def load_journal_mapping():
     return pd.read_sql(query, engine)
 
 
+def process_data(author_id):
+    df_parsed = parse_journals(author_id)
+    df_db = load_journal_mapping()
+
+    # типы
+    df_parsed["rinc_id"] = pd.to_numeric(df_parsed["rinc_id"], errors="coerce")
+    df_db["rinc_id"] = pd.to_numeric(df_db["rinc_id"], errors="coerce")
+
+    df_parsed = df_parsed.dropna(subset=["rinc_id"])
+    df_db = df_db.dropna(subset=["rinc_id"])
+
+    # merge
+    df_merged = df_parsed.merge(df_db, on="rinc_id", how="left")
+
+    # финальная таблица
+    final_df = df_merged[
+        ["author_id", "rinc_id", "journal", "hse_list_2", "publications"]
+    ].copy()
+
+    # pivot
+    pivot_df = final_df.pivot_table(
+        index="author_id",
+        columns="hse_list_2",
+        values="publications",
+        aggfunc="sum",
+        fill_value=0
+    ).reset_index()
+
+    return final_df, pivot_df
+
+
 # =========================
-# MAIN LOGIC
+# RUN
 # =========================
 
 if run_button and author_id:
 
-    with st.spinner("Сбор данных..."):
+    try:
+        with st.spinner("Обработка данных..."):
+            final_df, pivot_df = process_data(author_id)
 
-        driver = get_driver()
+        # =========================
+        # OUTPUT 1
+        # =========================
 
-        try:
-            # парсинг
-            open_author(driver, author_id)
-            df_parsed = parse_journals(driver, author_id)
+        st.subheader("Список публикаций автора (final_df)")
+        st.dataframe(final_df, use_container_width=True)
 
-            # база
-            df_db = load_journal_mapping()
+        st.download_button(
+            label="Скачать final_df.csv",
+            data=final_df.to_csv(index=False).encode("utf-8"),
+            file_name="final_df.csv",
+            mime="text/csv"
+        )
 
-            # типы
-            df_parsed["rinc_id"] = pd.to_numeric(df_parsed["rinc_id"], errors="coerce")
-            df_db["rinc_id"] = pd.to_numeric(df_db["rinc_id"], errors="coerce")
+        # =========================
+        # OUTPUT 2
+        # =========================
 
-            df_parsed = df_parsed.dropna(subset=["rinc_id"])
-            df_db = df_db.dropna(subset=["rinc_id"])
+        st.subheader("Сводная таблица по спискам НИУ ВШЭ (pivot_df)")
+        st.dataframe(pivot_df, use_container_width=True)
 
-            # merge
-            df_merged = df_parsed.merge(df_db, on="rinc_id", how="left")
+        st.download_button(
+            label="Скачать pivot_df.csv",
+            data=pivot_df.to_csv(index=False).encode("utf-8"),
+            file_name="pivot_df.csv",
+            mime="text/csv"
+        )
 
-            # final
-            final_df = df_merged[
-                ["author_id", "rinc_id", "journal", "hse_list_2", "publications"]
-            ].copy()
-
-            # pivot
-            pivot_df = final_df.pivot_table(
-                index="author_id",
-                columns="hse_list_2",
-                values="publications",
-                aggfunc="sum",
-                fill_value=0
-            ).reset_index()
-
-            # =========================
-            # OUTPUT
-            # =========================
-
-            st.subheader("Список публикаций автора")
-            st.dataframe(final_df)
-
-            st.download_button(
-                label="Скачать final_df.csv",
-                data=final_df.to_csv(index=False).encode("utf-8"),
-                file_name="final_df.csv",
-                mime="text/csv"
-            )
-
-            st.subheader("Сводная таблица по спискам НИУ ВШЭ")
-            st.dataframe(pivot_df)
-
-            st.download_button(
-                label="Скачать pivot_df.csv",
-                data=pivot_df.to_csv(index=False).encode("utf-8"),
-                file_name="pivot_df.csv",
-                mime="text/csv"
-            )
-
-        finally:
-            driver.quit()
+    except Exception as e:
+        st.error(f"Ошибка: {str(e)}")
