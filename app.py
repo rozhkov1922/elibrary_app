@@ -18,73 +18,89 @@ st.title("Парсинг публикаций автора eLibrary")
 st.warning("⚠️ Приложение работает только внутри корпоративной сети HSE.Work")
 
 st.markdown(
-    "Приложение получает список журналов автора из eLibrary по Author ID, "
-    "извлекает количество публикаций, сопоставляет журналы с базой НИУ ВШЭ "
-    "и формирует две таблицы: список публикаций автора и сводную таблицу "
-    "по категориям журналов."
+    """
+    Приложение получает список журналов автора из eLibrary по Author ID,
+    извлекает количество публикаций, сопоставляет их с базой НИУ ВШЭ и
+    формирует две таблицы: список публикаций автора и сводную таблицу
+    по категориям журналов.
+    """
 )
 
 author_id = st.number_input("Введите Author ID (РИНЦ)", min_value=1, step=1)
 run_button = st.button("Запустить")
 
 # =========================
-# PARSER (lxml)
+# PARSER (ROBUST REQUESTS)
 # =========================
 
-@st.cache_data(show_spinner=False)
 def parse_journals(author_id):
 
     url = f"https://elibrary.ru/author_items_titles.asp?id={author_id}&show_refs=1&hide_doubles=1"
 
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Referer": "https://elibrary.ru"
     }
 
     session = requests.Session()
 
-    # прогрев
-    session.get("https://elibrary.ru", headers=headers)
-    time.sleep(1)
+    last_error = None
 
-    response = session.get(url, headers=headers, timeout=20)
-
-    if response.status_code != 200:
-        raise Exception("Ошибка загрузки страницы eLibrary")
-
-    tree = html.fromstring(response.content)
-
-    rows = tree.xpath("//tr[starts-with(@id, 'title_')]")
-
-    data = []
-
-    for row in rows:
+    # 5 попыток (анти reset by peer)
+    for attempt in range(5):
         try:
-            rinc_id = int(row.attrib["id"].split("_")[1])
-            text = row.text_content().strip()
+            # прогрев сайта (важно для антибота)
+            session.get("https://elibrary.ru", headers=headers, timeout=20)
+            time.sleep(1)
 
-            match = re.match(r"(.+?)\s*\((\d+)\)", text)
+            response = session.get(url, headers=headers, timeout=20)
 
-            if match:
-                data.append({
-                    "author_id": author_id,
-                    "rinc_id": rinc_id,
-                    "journal": match.group(1),
-                    "publications": int(match.group(2))
-                })
-        except:
-            continue
+            if response.status_code != 200:
+                raise Exception(f"HTTP {response.status_code}")
 
-    df = pd.DataFrame(data)
+            tree = html.fromstring(response.content)
 
-    if df.empty:
-        raise Exception(
-            "Не удалось получить данные.\n"
-            "Возможна блокировка или отсутствует доступ из вашей сети."
-        )
+            rows = tree.xpath("//tr[starts-with(@id, 'title_')]")
 
-    return df
+            data = []
+
+            for row in rows:
+                try:
+                    rinc_id = int(row.attrib["id"].split("_")[1])
+                    text = row.text_content().strip()
+
+                    match = re.match(r"(.+?)\s*\((\d+)\)", text)
+
+                    if match:
+                        data.append({
+                            "author_id": author_id,
+                            "rinc_id": rinc_id,
+                            "journal": match.group(1),
+                            "publications": int(match.group(2))
+                        })
+                except:
+                    continue
+
+            df = pd.DataFrame(data)
+
+            if df.empty:
+                raise Exception("Empty response")
+
+            return df
+
+        except Exception as e:
+            last_error = e
+            time.sleep(2)
+
+    raise Exception(
+        f"Не удалось получить данные после 5 попыток.\n"
+        f"Причина: {last_error}\n\n"
+        f"Возможные причины:\n"
+        f"- блокировка eLibrary (Connection reset by peer)\n"
+        f"- вы вне сети HSE / РФ\n"
+        f"- антибот защита"
+    )
 
 # =========================
 # DB
@@ -104,7 +120,7 @@ def load_journal_mapping():
     return pd.read_sql(query, engine)
 
 # =========================
-# PROCESS
+# PROCESSING
 # =========================
 
 def process_data(author_id):
@@ -144,7 +160,6 @@ if run_button and author_id:
         with st.spinner("Обработка данных..."):
             final_df, pivot_df = process_data(author_id)
 
-        # ===== TABLE 1 =====
         st.subheader("Список публикаций автора (final_df)")
         st.dataframe(final_df, use_container_width=True)
 
@@ -155,7 +170,6 @@ if run_button and author_id:
             "text/csv"
         )
 
-        # ===== TABLE 2 =====
         st.subheader("Сводная таблица по спискам НИУ ВШЭ (pivot_df)")
         st.dataframe(pivot_df, use_container_width=True)
 
